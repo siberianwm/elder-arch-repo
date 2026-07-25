@@ -93,6 +93,7 @@ jobs:
             -v "$PWD:/work" -v /tmp/signing.key:/tmp/signing.key:ro \
             -v /tmp/signing.pass:/tmp/signing.pass:ro \
             -e GPG_KEYID="$GPG_KEYID" \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
             -w /work archlinux:base-devel bash -euo pipefail -c '
               pacman -Syu --noconfirm --needed go git
               useradd -m builder
@@ -127,8 +128,11 @@ jobs:
               for l in *.db *.files; do
                 if [ -L "$l" ]; then t=$(readlink "$l"); rm "$l"; cp "$t" "$l"; fi
               done
-              chown -R 1001:127 /work/out || true
               ls -la
+              # контейнер работает от root и забирает права на смонтированный
+              # каталог — возвращаем владельца раннеру, иначе следующие шаги
+              # не смогут ничего создать в рабочей директории
+              chown -R "$HOST_UID:$HOST_GID" /work
             '
           rm -f /tmp/signing.key /tmp/signing.pass
 
