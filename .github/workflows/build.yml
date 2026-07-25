@@ -1,0 +1,177 @@
+name: Сборка и публикация репозитория
+
+on:
+  schedule:
+    # ежедневно в 03:00 UTC (10:00 по Кемерово)
+    - cron: '0 3 * * *'
+  workflow_dispatch:          # ручной запуск кнопкой
+  push:
+    paths:
+      - 'packages/**'
+      - '.github/workflows/build.yml'
+
+concurrency:
+  group: repo-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write             # коммит обновлённого PKGBUILD
+  pages: write                # публикация
+  id-token: write             # OIDC для deploy-pages
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.ver.outputs.changed }}
+      latest:  ${{ steps.ver.outputs.latest }}
+      current: ${{ steps.ver.outputs.current }}
+
+    steps:
+      - name: Забрать репозиторий
+        uses: actions/checkout@v4
+
+      - name: Узнать актуальную версию Xray
+        id: ver
+        run: |
+          set -euo pipefail
+          # /releases, а НЕ /releases/latest: XTLS помечает свежие сборки как
+          # pre-release, и latest вернул бы версию трёхмесячной давности
+          LATEST=$(curl -sSL -H "Accept: application/vnd.github+json" \
+                     "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=1" \
+                   | jq -r '.[0].tag_name' | sed 's/^v//')
+          # тег приходит из ЧУЖОГО репозитория — валидируем строго,
+          # иначе он попадёт в shell как исполняемый текст
+          if ! [[ "$LATEST" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Тег не похож на версию: '$LATEST'"; exit 1
+          fi
+          CURRENT=$(grep -Po '^pkgver=\K.*' packages/xray-core/PKGBUILD)
+          {
+            echo "latest=$LATEST"
+            echo "current=$CURRENT"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$LATEST" != "$CURRENT" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Новая версия Xray: $CURRENT → $LATEST"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Версия актуальна ($CURRENT)"
+          fi
+
+      - name: Обновить PKGBUILD под новую версию
+        if: steps.ver.outputs.changed == 'true'
+        env:
+          V: ${{ steps.ver.outputs.latest }}
+        run: |
+          set -euo pipefail
+          URL="https://github.com/XTLS/Xray-core/archive/v${V}/Xray-core-${V}.tar.gz"
+          curl -sSL "$URL" -o /tmp/src.tar.gz
+          SHA=$(sha256sum /tmp/src.tar.gz | cut -d' ' -f1)
+          B2=$(b2sum      /tmp/src.tar.gz | cut -d' ' -f1)
+          cd packages/xray-core
+          sed -i "s/^pkgver=.*/pkgver=${V}/"             PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/"                PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('${SHA}')/" PKGBUILD
+          sed -i "s/^b2sums=.*/b2sums=('${B2}')/"        PKGBUILD
+          echo "Хеши пересчитаны с исходников по тегу v${V}"
+
+      - name: Собрать и подписать в контейнере Arch
+        env:
+          GPG_KEY:   ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASS:  ${{ secrets.GPG_PASSPHRASE }}
+          GPG_KEYID: ${{ secrets.GPG_KEYID }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # ключ передаём через файл, а не аргументом — иначе он виден в ps
+          printf '%s' "$GPG_KEY"  > /tmp/signing.key
+          printf '%s' "$GPG_PASS" > /tmp/signing.pass
+          docker run --rm \
+            -v "$PWD:/work" -v /tmp/signing.key:/tmp/signing.key:ro \
+            -v /tmp/signing.pass:/tmp/signing.pass:ro \
+            -e GPG_KEYID="$GPG_KEYID" \
+            -w /work archlinux:base-devel bash -euo pipefail -c '
+              pacman -Syu --noconfirm --needed go git
+              useradd -m builder
+              chown -R builder:builder /work
+
+              # ключ импортируем от имени сборщика: makepkg не работает под root
+              sudo -u builder gpg --batch --quiet --import /tmp/signing.key
+              install -d -o builder -g builder /home/builder/.gnupg
+              printf "allow-loopback-pinentry\n" > /home/builder/.gnupg/gpg-agent.conf
+              printf "pinentry-mode loopback\npassphrase-file /tmp/signing.pass\nbatch\nyes\n" \
+                > /home/builder/.gnupg/gpg.conf
+              chown builder:builder /home/builder/.gnupg/*
+              sudo -u builder gpg-connect-agent reloadagent /bye >/dev/null 2>&1 || true
+
+              for dir in packages/*/; do
+                name=$(basename "$dir")
+                echo "::group::Сборка $name"
+                # --sign подписывает пакет ключом GPGKEY
+                sudo -u builder env GPGKEY="$GPG_KEYID" \
+                  bash -c "cd /work/$dir && makepkg -Ccf --noconfirm --needed --sign"
+                cp "$dir"*.pkg.tar.zst "$dir"*.pkg.tar.zst.sig /work/out/
+                echo "::endgroup::"
+              done
+
+              cd /work/out
+              # --include-sigs вносит подписи пакетов в саму базу,
+              # чтобы pacman мог проверить их до скачивания
+              repo-add --include-sigs --new elder-arch-repo.db.tar.zst *.pkg.tar.zst
+
+              # repo-add создаёт СИМЛИНКИ .db и .files, но GitHub Pages их
+              # не разворачивает — заменяем реальными копиями
+              for l in *.db *.files; do
+                if [ -L "$l" ]; then t=$(readlink "$l"); rm "$l"; cp "$t" "$l"; fi
+              done
+              chown -R 1001:127 /work/out || true
+              ls -la
+            '
+          rm -f /tmp/signing.key /tmp/signing.pass
+
+      - name: Собрать каталог для публикации
+        run: |
+          set -euo pipefail
+          mkdir -p pages/x86_64
+          cp -a out/. pages/x86_64/
+          # публичный ключ — по нему машина проверяет подписи пакетов
+          cp elder-arch-repo.pub pages/
+          cat > pages/index.html <<'HTML'
+          <!doctype html><meta charset="utf-8">
+          <title>elder-arch-repo</title>
+          <h1>elder-arch-repo</h1>
+          <p>Личный pacman-репозиторий. Пакеты собираются из исходников
+          официального <a href="https://github.com/XTLS/Xray-core">XTLS/Xray-core</a>
+          и подписываются GPG.</p>
+          <p>Подключение описано в README репозитория.</p>
+          HTML
+          ls -la pages/x86_64/
+
+      - name: Загрузить артефакт Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages
+
+      - name: Зафиксировать обновлённый PKGBUILD
+        if: steps.ver.outputs.changed == 'true'
+        env:
+          FROM: ${{ steps.ver.outputs.current }}
+          TO:   ${{ steps.ver.outputs.latest }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add packages/
+          git commit -qm "xray-core: ${FROM} → ${TO}"
+          git push
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Опубликовать на Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,9 @@
+# артефакты локальной сборки
+*.pkg.tar.zst
+*.pkg.tar.zst.sig
+*.db*
+*.files*
+src/
+pkg/
+out/
+pages/

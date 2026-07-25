@@ -1,0 +1,51 @@
+# Локальный пакет: Xray-core в паре с версией на дедике.
+# Отличия от AUR-пакетов:
+#   * бинарь кладётся в /usr/bin/xray (в PATH), а не в /usr/lib/x-ui/bin/
+#   * нет post_install-хуков, качающих geo-базы со сторонних репозиториев —
+#     свои ассеты ставим отдельно и осознанно
+#   * имя не пересекается с AUR (xray / xray-bin), чтобы paru не откатил
+#     версию до последней «не-pre» (26.3.27)
+
+pkgname=xray-core
+pkgver=26.7.11
+pkgrel=1
+pkgdesc="Xray-core: VLESS/XHTTP/REALITY (сборка из исходников XTLS)"
+arch=(x86_64 aarch64)
+url="https://github.com/XTLS/Xray-core"
+license=(MPL-2.0)
+depends=(glibc)
+makedepends=(go)
+provides=(xray)
+conflicts=(xray xray-bin)
+options=(!debug)
+source=("$url/archive/v$pkgver/Xray-core-$pkgver.tar.gz")
+sha256sums=('7c191254c0d8cc8be7673904739fc7329b601947da5377ef85900a0cd0a85e23')
+b2sums=('503ebd3c5f8acce66c47fdb4870c3d4ae2c3a2040b726665c22673f0f60d65ac9ea1586765d74e7fe82488a33e903d63c4d7cdb96fed8d9c1d66a43248253e85')
+
+build() {
+  cd "Xray-core-$pkgver"
+  export GOCACHE="$srcdir/go-build"
+  export GOPATH="$srcdir/go"
+  export CGO_CPPFLAGS="$CPPFLAGS"
+  export CGO_CFLAGS="$CFLAGS"
+  export CGO_CXXFLAGS="$CXXFLAGS"
+  export CGO_LDFLAGS="$LDFLAGS"
+  export CGO_ENABLED=1
+  export GOFLAGS="-buildmode=pie -trimpath -mod=readonly -modcacherw -buildvcs=false"
+  go build -v -o build/xray \
+    -ldflags="-linkmode=external -s -w -buildid= -extldflags=-Wl,-z,relro,-z,now" \
+    ./main
+}
+
+check() {
+  cd "Xray-core-$pkgver"
+  ./build/xray version
+}
+
+package() {
+  cd "Xray-core-$pkgver"
+  install -vDm755 build/xray "$pkgdir/usr/bin/xray"
+  install -vDm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+  # каталог под geo-ассеты; сами файлы ставятся отдельно
+  install -vdm755 "$pkgdir/usr/share/xray"
+}
