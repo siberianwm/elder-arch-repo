@@ -2,9 +2,15 @@ name: Сборка и публикация репозитория
 
 on:
   schedule:
-    # ежедневно в 03:00 UTC (10:00 по Кемерово)
+    # ежедневно в 03:00 UTC (10:00 по Кемерово) — только ПРОВЕРКА версии xray,
+    # сборка запускается лишь если версия у XTLS выросла
     - cron: '0 3 * * *'
-  workflow_dispatch:          # ручной запуск кнопкой
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: 'Какие пакеты собрать: имена через пробел, либо all'
+        required: false
+        default: 'all'
   push:
     paths:
       - 'packages/**'
@@ -23,13 +29,14 @@ jobs:
   build:
     runs-on: ubuntu-latest
     outputs:
-      changed: ${{ steps.ver.outputs.changed }}
-      latest:  ${{ steps.ver.outputs.latest }}
-      current: ${{ steps.ver.outputs.current }}
+      list: ${{ steps.plan.outputs.list }}
 
     steps:
       - name: Забрать репозиторий
         uses: actions/checkout@v4
+        with:
+          # нужен предыдущий коммит, чтобы понять, какие PKGBUILD изменились
+          fetch-depth: 2
 
       - name: Узнать актуальную версию Xray
         id: ver
@@ -78,25 +85,111 @@ jobs:
           sed -i "s/^b2sums=.*/b2sums=('${B2}')/"        PKGBUILD
           echo "Хеши пересчитаны с исходников по тегу v${V}"
 
-      - name: Собрать и подписать в контейнере Arch
+      # Ничего не собираем «на всякий случай»: пересборка одного и того же
+      # каждую ночь только жжёт время раннера и плодит в репозитории новые
+      # файлы с той же версией.
+      - name: Определить, что собирать
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          XRAY_CHANGED: ${{ steps.ver.outputs.changed }}
+          INPUT_PKGS: ${{ inputs.packages }}
+        run: |
+          set -euo pipefail
+          ALL=$(find packages -mindepth 1 -maxdepth 1 -type d -printf '%f ')
+
+          case "$EVENT" in
+            schedule)
+              # по расписанию трогаем только xray и только при новой версии;
+              # mpv-git сюда не попадает намеренно — он резервный и собирается
+              # руками, когда CachyOS не успел пересобрать его под новый soname
+              if [ "$XRAY_CHANGED" = "true" ]; then LIST="xray-core"; else LIST=""; fi
+              ;;
+            workflow_dispatch)
+              if [ -z "${INPUT_PKGS:-}" ] || [ "${INPUT_PKGS}" = "all" ]; then
+                LIST="$ALL"
+              else
+                LIST="$INPUT_PKGS"
+              fi
+              ;;
+            push)
+              # правка самого workflow затрагивает все сборки — пересобираем всё
+              if git diff --name-only HEAD~1 HEAD | grep -q '^\.github/workflows/'; then
+                LIST="$ALL"
+              else
+                LIST=$(git diff --name-only HEAD~1 HEAD -- packages/ \
+                        | cut -d/ -f2 | sort -u | tr '\n' ' ')
+              fi
+              ;;
+            *)
+              LIST="$ALL"
+              ;;
+          esac
+
+          # имена могли прийти из ручного ввода — пропускаем только те,
+          # что реально существуют, чтобы в shell не уехал произвольный текст
+          SAFE=""
+          for p in $LIST; do
+            if [ -f "packages/$p/PKGBUILD" ]; then
+              SAFE="$SAFE $p"
+            else
+              echo "::warning::Пакет '$p' пропущен: packages/$p/PKGBUILD не найден"
+            fi
+          done
+          SAFE=$(echo "$SAFE" | xargs || true)
+
+          echo "list=$SAFE" >> "$GITHUB_OUTPUT"
+          if [ -z "$SAFE" ]; then
+            echo "::notice::Собирать нечего — публикуем репозиторий как есть"
+          else
+            echo "::notice::К сборке: $SAFE"
+          fi
+
+      # База репозитория пересоздаётся с нуля из того, что лежит в out/.
+      # Раз собираем выборочно, всё остальное надо вернуть обратно, иначе
+      # пакеты, которые мы в этот раз не трогали, просто исчезнут из репозитория.
+      - name: Забрать уже опубликованные пакеты
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          BASE="https://siberianwm.github.io/elder-arch-repo/x86_64"
+          if curl -fsSL "$BASE/elder-arch-repo.db" -o /tmp/current.db 2>/dev/null; then
+            FILES=$(zstd -dc /tmp/current.db 2>/dev/null | tar -xO --wildcards '*/desc' 2>/dev/null \
+                    | grep -A1 '^%FILENAME%$' | grep '\.pkg\.tar\.zst$' || true)
+            n=0
+            for f in $FILES; do
+              if curl -fsSL "$BASE/$f" -o "out/$f" 2>/dev/null; then
+                curl -fsSL "$BASE/$f.sig" -o "out/$f.sig" 2>/dev/null || true
+                n=$((n+1))
+              fi
+            done
+            echo "::notice::Возвращено ранее опубликованных пакетов: $n"
+          else
+            echo "::notice::Опубликованной базы нет — репозиторий собирается с нуля"
+          fi
+
+      - name: Собрать и подписать в контейнере CachyOS
+        if: steps.plan.outputs.list != ''
         env:
           GPG_KEY:   ${{ secrets.GPG_PRIVATE_KEY }}
           GPG_PASS:  ${{ secrets.GPG_PASSPHRASE }}
           GPG_KEYID: ${{ secrets.GPG_KEYID }}
+          BUILD_LIST: ${{ steps.plan.outputs.list }}
         run: |
           set -euo pipefail
-          mkdir -p out
           # ключ передаём через файл, а не аргументом — иначе он виден в ps
           printf '%s' "$GPG_KEY"  > /tmp/signing.key
           printf '%s' "$GPG_PASS" > /tmp/signing.pass
+          # образ CachyOS вместо ванильного Arch: те же флаги x86-64-v3, что и
+          # в системе, куда пакет поедет — сборка однородна с остальными пакетами
           docker run --rm \
             -v "$PWD:/work" -v /tmp/signing.key:/tmp/signing.key:ro \
             -v /tmp/signing.pass:/tmp/signing.pass:ro \
             -e GPG_KEYID="$GPG_KEYID" \
+            -e BUILD_LIST="$BUILD_LIST" \
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
-            -w /work archlinux:base-devel bash -euo pipefail -c '
-              # devtools даёт arch-meson, без него не собрать mpv и подобные
-              pacman -Syu --noconfirm --needed git devtools
+            -w /work cachyos/cachyos-v3:latest bash -euo pipefail -c '
+              pacman -Syu --noconfirm --needed base-devel git devtools
               useradd -m builder
               # makepkg -s ставит зависимости пакета через pacman и требует sudo;
               # контейнер одноразовый, права живут только внутри него
@@ -113,13 +206,17 @@ jobs:
               chown builder:builder /home/builder/.gnupg/*
               sudo -u builder gpg-connect-agent reloadagent /bye >/dev/null 2>&1 || true
 
-              for dir in packages/*/; do
-                name=$(basename "$dir")
+              for name in $BUILD_LIST; do
+                dir="packages/$name"
                 echo "::group::Сборка $name"
+                # -s ставит зависимости из самого PKGBUILD, поэтому добавление
+                # нового пакета не требует правки workflow
                 # --sign подписывает пакет ключом GPGKEY
                 sudo -u builder env GPGKEY="$GPG_KEYID" \
                   bash -c "cd /work/$dir && makepkg -Ccfs --noconfirm --needed --sign"
-                cp "$dir"*.pkg.tar.zst "$dir"*.pkg.tar.zst.sig /work/out/
+                # прошлые версии этого же пакета убираем, иначе на Pages копится мусор
+                rm -f /work/out/"$name"-*.pkg.tar.zst /work/out/"$name"-*.pkg.tar.zst.sig
+                cp "$dir"/*.pkg.tar.zst "$dir"/*.pkg.tar.zst.sig /work/out/
                 echo "::endgroup::"
               done
 
@@ -141,6 +238,25 @@ jobs:
             '
           rm -f /tmp/signing.key /tmp/signing.pass
 
+      # База нужна и когда ничего не собирали: тогда она строится из пакетов,
+      # возвращённых с Pages, и репозиторий публикуется без изменений
+      - name: Пересобрать базу, если сборки не было
+        if: steps.plan.outputs.list == ''
+        run: |
+          set -euo pipefail
+          if ls out/*.pkg.tar.zst >/dev/null 2>&1; then
+            docker run --rm -v "$PWD/out:/out" -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+              -w /out archlinux:base-devel bash -euo pipefail -c '
+                repo-add --include-sigs --new elder-arch-repo.db.tar.zst *.pkg.tar.zst
+                for l in *.db *.files; do
+                  if [ -L "$l" ]; then t=$(readlink "$l"); rm "$l"; cp "$t" "$l"; fi
+                done
+                chown -R "$HOST_UID:$HOST_GID" /out
+              '
+          else
+            echo "::warning::Пакетов нет вообще — публиковать нечего"
+          fi
+
       - name: Собрать каталог для публикации
         run: |
           set -euo pipefail
@@ -153,7 +269,6 @@ jobs:
           <title>elder-arch-repo</title>
           <h1>elder-arch-repo</h1>
           <p>Личный pacman-репозиторий. Пакеты собираются из исходников
-          официального <a href="https://github.com/XTLS/Xray-core">XTLS/Xray-core</a>
           и подписываются GPG.</p>
           <p>Подключение описано в README репозитория.</p>
           HTML

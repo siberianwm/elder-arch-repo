@@ -35,7 +35,7 @@ makedepends=('git' 'meson' 'python-docutils' 'ladspa' 'wayland-protocols'
 optdepends=('yt-dlp: for video-sharing websites playback')
 provides=('libmpv.so' 'mpv')
 conflicts=('mpv')
-options=('!emptydirs')
+options=('!emptydirs' '!debug')   # !debug — не плодить отдельный debug-пакет в репозитории
 source=("git+https://github.com/mpv-player/mpv.git")
 sha256sums=('SKIP')
 
