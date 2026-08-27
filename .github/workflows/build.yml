@@ -190,6 +190,12 @@ jobs:
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
             -w /work cachyos/cachyos-v3:latest bash -euo pipefail -c '
               pacman -Syu --noconfirm --needed base-devel git devtools
+              # Образ CachyOS собирает с -march=native: на раннере GitHub есть
+              # AVX-512, у целевой машины (Haswell) его нет, и бинарь падает
+              # с SIGILL. Архитектуру задаём явно — v3 это AVX2/FMA/BMI, ровно
+              # то, что поддерживает целевой процессор.
+              sed -i -E "s/-march=[a-z0-9._-]+/-march=x86-64-v3/g; s/-mtune=[a-z0-9._-]+/-mtune=generic/g" /etc/makepkg.conf
+              grep -E "^(C|CXX|RUST)FLAGS" /etc/makepkg.conf
               useradd -m builder
               # makepkg -s ставит зависимости пакета через pacman и требует sudo;
               # контейнер одноразовый, права живут только внутри него
