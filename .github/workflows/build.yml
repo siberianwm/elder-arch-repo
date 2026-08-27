@@ -100,7 +100,7 @@ jobs:
               useradd -m builder
               # makepkg -s ставит зависимости пакета через pacman и требует sudo;
               # контейнер одноразовый, права живут только внутри него
-              echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+              echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
               chmod 440 /etc/sudoers.d/builder
               chown -R builder:builder /work
 
