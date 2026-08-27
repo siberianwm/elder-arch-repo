@@ -7,3 +7,9 @@ src/
 pkg/
 out/
 pages/
+
+# исходники, которые makepkg кладёт рядом с PKGBUILD:
+# скачанные архивы и git-клоны (у mpv-git это сотни мегабайт)
+*.tar.gz
+*.tar.xz
+packages/*/*/
